@@ -494,6 +494,64 @@ fn primary_screen_area() -> Option<Rect> {
         .filter(|r| r.w > 0 && r.h > 0)
 }
 
+/// The screen a window is on: the one whose full frame (menu bar and Dock
+/// included) holds the window's centre. A window whose centre is on none
+/// goes to the first screen; with no screens there is no answer.
+fn screen_at(screens: &[Screen], frame: Rect) -> Option<DisplayId> {
+    let (cx, cy) = frame.center();
+    screens
+        .iter()
+        .find(|s| s.frame.contains_point(cx, cy))
+        .or_else(|| screens.first())
+        .map(|s| s.display_id)
+}
+
+#[cfg(test)]
+mod screen_at_tests {
+    use super::*;
+
+    fn screen(display_id: u32, x: i32, y: i32, w: i32, h: i32) -> Screen {
+        let frame = Rect::new(x, y, w, h);
+        Screen {
+            display_id,
+            frame,
+            visible: frame,
+        }
+    }
+
+    #[test]
+    fn a_window_is_on_the_screen_holding_its_centre() {
+        let screens = [screen(1, 0, 0, 1440, 900), screen(2, 1440, -180, 1920, 1080)];
+        assert_eq!(screen_at(&screens, Rect::new(100, 100, 400, 300)), Some(1));
+        assert_eq!(screen_at(&screens, Rect::new(1600, 0, 400, 300)), Some(2));
+    }
+
+    #[test]
+    fn a_window_over_the_menu_bar_still_counts_as_on_its_screen() {
+        // A window dragged up into the second screen's menu bar strip.
+        let screens = [screen(1, 0, 0, 1440, 900), screen(2, 1440, -180, 1920, 1080)];
+        assert_eq!(screen_at(&screens, Rect::new(1500, -170, 400, 100)), Some(2));
+    }
+
+    #[test]
+    fn a_window_straddling_two_screens_goes_by_its_centre() {
+        let screens = [screen(1, 0, 0, 1440, 900), screen(2, 1440, -180, 1920, 1080)];
+        assert_eq!(screen_at(&screens, Rect::new(1300, 100, 400, 300)), Some(2));
+        assert_eq!(screen_at(&screens, Rect::new(1100, 100, 400, 300)), Some(1));
+    }
+
+    #[test]
+    fn a_window_on_no_screen_goes_to_the_first() {
+        let screens = [screen(1, 0, 0, 1440, 900), screen(2, 1440, 0, 1920, 1080)];
+        assert_eq!(screen_at(&screens, Rect::new(-5000, 0, 100, 100)), Some(1));
+    }
+
+    #[test]
+    fn no_screens_means_no_answer() {
+        assert_eq!(screen_at(&[], Rect::new(0, 0, 100, 100)), None);
+    }
+}
+
 #[cfg(test)]
 mod screen_tests {
     use super::*;
@@ -646,9 +704,12 @@ impl SpaceApi {
         }
     }
 
-    /// The desktops (not full-screen apps) of the display named `display`
-    /// (or of the first one), in Mission Control order.
-    fn spaces(&self, cid: i32, display: Option<&str>) -> Vec<u64> {
+    /// The desktops (not full-screen apps) of the display named `display`, in
+    /// Mission Control order. When no display has that name, the first one
+    /// stands in if `fallback_first` (the main display, which the system
+    /// sometimes lists under another name); otherwise there are none, rather
+    /// than the Spaces of some other display.
+    fn spaces(&self, cid: i32, display: Option<&str>, fallback_first: bool) -> Vec<u64> {
         let Some(list) = self.list else {
             return Vec::new();
         };
@@ -664,7 +725,10 @@ impl SpaceApi {
                     let name = string_value(CFDictionaryGetValue(*d, self.display_key.ptr()));
                     display.is_some_and(|want| name.as_deref() == Some(want))
                 })
-                .or_else(|| (count > 0).then(|| CFArrayGetValueAtIndex(displays.ptr(), 0)));
+                .or_else(|| {
+                    (fallback_first && count > 0)
+                        .then(|| CFArrayGetValueAtIndex(displays.ptr(), 0))
+                });
             let Some(dict) = chosen else {
                 return out;
             };
@@ -980,8 +1044,13 @@ pub struct MacBackend {
     apps: HashMap<i32, AppHandle>,
     windows: HashMap<WinId, TrackedWindow>,
     lookups: HashMap<WinId, u8>,
-    display: Rect,
-    /// Windows that exist on any Space, as of the last `windows()` call.
+    /// The attached screens, as of the last `displays()` call.
+    screens: Vec<Screen>,
+    /// The windows on screen with the display each is on, listed once per
+    /// poll: `displays()` starts a poll and clears it, and the first
+    /// `display_windows()` after that fills it for the other displays too.
+    listed: Option<Vec<(DisplayId, WindowInfo)>>,
+    /// Windows that exist on any Space, as of the last listing.
     alive: HashSet<WinId>,
     connection: i32,
     /// Created the first time a drop target is highlighted.
@@ -1011,7 +1080,8 @@ impl MacBackend {
             apps: HashMap::new(),
             windows: HashMap::new(),
             lookups: HashMap::new(),
-            display: Rect::default(),
+            screens: Vec::new(),
+            listed: None,
             alive: HashSet::new(),
             connection: unsafe { CGSMainConnectionID() },
             overlay: None,
@@ -1021,6 +1091,65 @@ impl MacBackend {
             area: Rect::default(),
             hotkeys: hotkeys::HotkeyManager::default(),
         }
+    }
+
+    /// Every window on screen, on every display, front to back, each with
+    /// the display it is on. Also refreshes which windows exist and the AX
+    /// handles of the new ones.
+    fn list_windows(&mut self) -> Vec<(DisplayId, WindowInfo)> {
+        if self.screens.is_empty() {
+            self.screens = screens();
+        }
+        let cg = cg_windows(true);
+        let all = cg_windows(false);
+        let present: HashSet<WinId> = cg.iter().map(|w| w.id).collect();
+        self.alive = all
+            .iter()
+            .map(|w| w.id)
+            .chain(present.iter().copied())
+            .collect();
+        // Keep the AX handles of windows on other Spaces: they stay valid,
+        // and the app only lists the windows of the active Space.
+        let alive = &self.alive;
+        self.windows.retain(|id, _| alive.contains(id));
+        self.lookups.retain(|id, _| present.contains(id));
+        let live_pids: HashSet<i32> = all.iter().chain(&cg).map(|w| w.pid).collect();
+        self.apps.retain(|pid, _| live_pids.contains(pid));
+
+        // Ask each app with unknown windows for its AX windows, once per poll.
+        let mut unknown: HashMap<i32, HashSet<WinId>> = HashMap::new();
+        for w in &cg {
+            if !self.windows.contains_key(&w.id)
+                && self.lookups.get(&w.id).copied().unwrap_or(0) < MAX_LOOKUPS
+            {
+                unknown.entry(w.pid).or_default().insert(w.id);
+            }
+        }
+        for (pid, ids) in unknown {
+            if pid == std::process::id() as i32 {
+                continue;
+            }
+            self.discover(pid, &ids);
+            for id in ids.into_iter().filter(|id| !self.windows.contains_key(id)) {
+                *self.lookups.entry(id).or_default() += 1;
+            }
+        }
+
+        let main = unsafe { CGMainDisplayID() };
+        cg.into_iter()
+            .map(|w| {
+                let display = screen_at(&self.screens, w.frame).unwrap_or(main);
+                let tracked = self.windows.get(&w.id);
+                let info = WindowInfo {
+                    id: w.id,
+                    frame: w.frame,
+                    app: w.app,
+                    tileable: tracked.is_some_and(|t| t.tileable),
+                    movable: tracked.is_some_and(|t| t.movable),
+                };
+                (display, info)
+            })
+            .collect()
     }
 
     fn app(&mut self, pid: i32) -> Option<AXUIElementRef> {
@@ -1193,55 +1322,28 @@ impl Backend for MacBackend {
     }
 
     fn windows(&mut self) -> Vec<WindowInfo> {
-        let cg = cg_windows(true);
-        let all = cg_windows(false);
-        let present: HashSet<WinId> = cg.iter().map(|w| w.id).collect();
-        self.alive = all
+        self.listed = None;
+        self.display_windows(unsafe { CGMainDisplayID() })
+    }
+
+    fn display_windows(&mut self, display: DisplayId) -> Vec<WindowInfo> {
+        if self.listed.is_none() {
+            let listed = self.list_windows();
+            self.listed = Some(listed);
+        }
+        self.listed
             .iter()
-            .map(|w| w.id)
-            .chain(present.iter().copied())
-            .collect();
-        // Keep the AX handles of windows on other Spaces: they stay valid,
-        // and the app only lists the windows of the active Space.
-        let alive = &self.alive;
-        self.windows.retain(|id, _| alive.contains(id));
-        self.lookups.retain(|id, _| present.contains(id));
-        let live_pids: HashSet<i32> = all.iter().chain(&cg).map(|w| w.pid).collect();
-        self.apps.retain(|pid, _| live_pids.contains(pid));
+            .flatten()
+            .filter(|(d, _)| *d == display)
+            .map(|(_, w)| w.clone())
+            .collect()
+    }
 
-        // Ask each app with unknown windows for its AX windows, once per poll.
-        let mut unknown: HashMap<i32, HashSet<WinId>> = HashMap::new();
-        for w in &cg {
-            if !self.windows.contains_key(&w.id)
-                && self.lookups.get(&w.id).copied().unwrap_or(0) < MAX_LOOKUPS
-            {
-                unknown.entry(w.pid).or_default().insert(w.id);
-            }
-        }
-        for (pid, ids) in unknown {
-            if pid == std::process::id() as i32 {
-                continue;
-            }
-            self.discover(pid, &ids);
-            for id in ids.into_iter().filter(|id| !self.windows.contains_key(id)) {
-                *self.lookups.entry(id).or_default() += 1;
-            }
-        }
-
-        let display = self.display;
-        cg.into_iter()
-            .map(|w| {
-                let (cx, cy) = w.frame.center();
-                let on_tiled_display = display.w == 0 || display.contains_point(cx, cy);
-                let tracked = self.windows.get(&w.id).filter(|_| on_tiled_display);
-                WindowInfo {
-                    id: w.id,
-                    frame: w.frame,
-                    app: w.app,
-                    tileable: tracked.is_some_and(|t| t.tileable),
-                    movable: tracked.is_some_and(|t| t.movable),
-                }
-            })
+    fn window_displays(&mut self, windows: &[WindowInfo]) -> HashMap<WinId, DisplayId> {
+        let main = unsafe { CGMainDisplayID() };
+        windows
+            .iter()
+            .map(|w| (w.id, screen_at(&self.screens, w.frame).unwrap_or(main)))
             .collect()
     }
 
@@ -1257,7 +1359,6 @@ impl Backend for MacBackend {
 
     fn tiling_area(&mut self) -> Rect {
         let full = cg_to_rect(unsafe { CGDisplayBounds(CGMainDisplayID()) });
-        self.display = full;
         let visible = primary_screen_area().unwrap_or_else(|| {
             warn!("NSScreen unavailable; assuming a 25pt menu bar");
             Rect::new(full.x, full.y + 25, full.w, full.h - 25)
@@ -1289,7 +1390,11 @@ impl Backend for MacBackend {
     }
 
     fn displays(&mut self) -> Vec<Display> {
-        let mut out: Vec<Display> = screens()
+        // This starts a poll: the windows are listed again for it.
+        self.listed = None;
+        self.screens = screens();
+        let mut out: Vec<Display> = self
+            .screens
             .iter()
             .map(|screen| Display {
                 id: screen.display_id,
@@ -1373,7 +1478,10 @@ impl Backend for MacBackend {
 
     fn display_spaces(&mut self, display: DisplayId) -> Vec<u64> {
         let uuid = display_uuid(display).and_then(|u| string_value(u.ptr()));
-        let mut spaces = self.space_api.spaces(self.connection, uuid.as_deref());
+        let main = display == unsafe { CGMainDisplayID() };
+        let mut spaces = self
+            .space_api
+            .spaces(self.connection, uuid.as_deref(), main);
         if spaces.is_empty() {
             spaces.push(self.display_active_space(display));
         }
