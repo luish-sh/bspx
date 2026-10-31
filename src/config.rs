@@ -47,6 +47,9 @@ pub struct Config {
     /// The window under the pointer gets focus (and is raised: macOS has no
     /// focus without raising, short of disabling SIP).
     pub focus_follows_mouse: bool,
+    /// Commands act on the display under the pointer instead of the display
+    /// of the focused window.
+    pub commands_follow_cursor: bool,
     /// How much to log; `None` leaves it as bspx was started with.
     pub log_level: Option<log::LevelFilter>,
     /// Space names, by Space number (from 1, as in Mission Control).
@@ -110,6 +113,7 @@ impl Default for Config {
             mouse_action2: MouseAction::Resize,
             mouse_follows_focus: false,
             focus_follows_mouse: false,
+            commands_follow_cursor: false,
             log_level: None,
             labels: BTreeMap::new(),
             space_rules: Vec::new(),
@@ -148,6 +152,7 @@ pub const KEYS: &[&str] = &[
     "mouse_action2",
     "mouse_follows_focus",
     "focus_follows_mouse",
+    "commands_follow_cursor",
     "log_level",
 ];
 
@@ -363,6 +368,9 @@ impl Config {
             "drag_swap" => self.drag_swap = on_off(key, one(key, args)?)?,
             "mouse_follows_focus" => self.mouse_follows_focus = on_off(key, one(key, args)?)?,
             "focus_follows_mouse" => self.focus_follows_mouse = on_off(key, one(key, args)?)?,
+            "commands_follow_cursor" => {
+                self.commands_follow_cursor = on_off(key, one(key, args)?)?;
+            }
             "log_level" => {
                 let v = one(key, args)?;
                 self.log_level = match v {
@@ -441,6 +449,7 @@ impl Config {
             "drag_swap" => on_off_name(self.drag_swap),
             "mouse_follows_focus" => on_off_name(self.mouse_follows_focus),
             "focus_follows_mouse" => on_off_name(self.focus_follows_mouse),
+            "commands_follow_cursor" => on_off_name(self.commands_follow_cursor),
             "log_level" => self
                 .log_level
                 .map_or("default".into(), |l| l.as_str().to_lowercase()),
@@ -625,6 +634,9 @@ mod tests {
         c.set("focus_follows_mouse", &["on"]).unwrap();
         assert!(c.mouse_follows_focus && c.focus_follows_mouse);
         assert_eq!(c.get("focus_follows_mouse").unwrap(), "on");
+        assert!(!c.commands_follow_cursor);
+        c.set("commands_follow_cursor", &["on"]).unwrap();
+        assert!(c.commands_follow_cursor);
         assert!(c.set("focus_follows_mouse", &["sometimes"]).is_err());
     }
 

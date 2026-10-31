@@ -12,6 +12,31 @@ pub enum Zoom {
     Parent,
 }
 
+/// Which display a display command means. Displays are numbered from 1,
+/// from left to right (then top to bottom).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisplayTarget {
+    Next,
+    Prev,
+    Number(usize),
+}
+
+impl DisplayTarget {
+    fn parse(cmd: &str, word: Option<&&str>) -> Result<Self, String> {
+        match word.copied() {
+            None => Err(format!("{cmd}: missing display (next, prev or a number)")),
+            Some("next") => Ok(Self::Next),
+            Some("prev") => Ok(Self::Prev),
+            Some(n) => n
+                .parse()
+                .ok()
+                .filter(|n| *n > 0)
+                .map(Self::Number)
+                .ok_or_else(|| format!("{cmd}: '{n}' is not a display number")),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     /// Focus the neighbouring window.
@@ -66,6 +91,10 @@ pub enum Command {
     Send(String),
     /// Switch to a Space, by number or label.
     Space(String),
+    /// Focus a window on another display.
+    Display(DisplayTarget),
+    /// Move the focused window to another display's layout.
+    SendDisplay(DisplayTarget),
     /// Tile a Space's windows (`float: false`) or leave them alone.
     Layout { space: String, float: bool },
     /// Add a keyboard shortcut line; `None` lists them.
@@ -92,6 +121,8 @@ commands:
   space <space>                            switch to a Space
   layout <space> <bsp|float>               tile a Space, or leave its windows be
   send <space>                             move the focused window to a Space
+  display <next|prev|n>                    focus a window on another display
+  send-display <next|prev|n>               move the focused window to another display
   retile | reload | query | quit
 
 settings (put these in ~/.config/bspx/bspxrc):
@@ -189,6 +220,10 @@ impl Command {
                     .ok_or("space: missing Space number or label")?
                     .to_string(),
             ),
+            Some("display") => Command::Display(DisplayTarget::parse("display", words.get(1))?),
+            Some("send-display") => {
+                Command::SendDisplay(DisplayTarget::parse("send-display", words.get(1))?)
+            }
             Some("layout") => {
                 let space = words
                     .get(1)
@@ -270,7 +305,9 @@ impl Command {
             | Command::Zoom(_)
             | Command::Grid(_)
             | Command::Send(_)
-            | Command::Space(_) => 2,
+            | Command::Space(_)
+            | Command::Display(_)
+            | Command::SendDisplay(_) => 2,
             Command::Resize(..) | Command::Label(_) | Command::Layout { .. } => 3,
             _ => 1,
         };
@@ -304,6 +341,25 @@ pub fn parse_grid(spec: &str) -> Result<[u32; 6], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_displays() {
+        assert_eq!(
+            Command::parse("display next"),
+            Ok(Command::Display(DisplayTarget::Next))
+        );
+        assert_eq!(
+            Command::parse("display prev"),
+            Ok(Command::Display(DisplayTarget::Prev))
+        );
+        assert_eq!(
+            Command::parse("send-display 2"),
+            Ok(Command::SendDisplay(DisplayTarget::Number(2)))
+        );
+        assert!(Command::parse("display").is_err());
+        assert!(Command::parse("display 0").is_err());
+        assert!(Command::parse("send-display left").is_err());
+    }
 
     #[test]
     fn parses_spaces() {

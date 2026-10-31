@@ -6,7 +6,7 @@ use log::{debug, info, warn};
 
 use crate::anim::Animator;
 use crate::bsp::{self, BspTree, MinSizes, WinId};
-use crate::command::{Command, Zoom};
+use crate::command::{Command, DisplayTarget, Zoom};
 use crate::config::{Config, MouseAction, app_matches};
 use crate::geometry::{Direction, Rect};
 use crate::platform::{
@@ -1120,6 +1120,78 @@ impl<B: Backend> Manager<B> {
             .map(|(&d, _)| d)
     }
 
+    /// Every display, from left to right and then from top to bottom: the
+    /// order `display 1`, `display next` and the like count in.
+    fn display_order(&self) -> Vec<DisplayId> {
+        let mut all: Vec<(i32, i32, DisplayId)> = self
+            .others
+            .iter()
+            .map(|(&d, s)| (s.area.x, s.area.y, d))
+            .collect();
+        all.push((self.area.x, self.area.y, self.display));
+        all.sort_unstable();
+        all.into_iter().map(|(_, _, d)| d).collect()
+    }
+
+    /// The display a display command means, counted from the working one.
+    fn resolve_display(&self, target: DisplayTarget) -> Result<DisplayId, String> {
+        let order = self.display_order();
+        let here = order.iter().position(|d| *d == self.display).unwrap_or(0);
+        match target {
+            DisplayTarget::Next => Ok(order[(here + 1) % order.len()]),
+            DisplayTarget::Prev => Ok(order[(here + order.len() - 1) % order.len()]),
+            DisplayTarget::Number(n) => n
+                .checked_sub(1)
+                .and_then(|i| order.get(i))
+                .copied()
+                .ok_or_else(|| format!("there is no display {n} (there are {})", order.len())),
+        }
+    }
+
+    /// The nearest display with windows lying beyond the working display's
+    /// edge in direction `dir`.
+    fn adjacent_display(&self, dir: Direction) -> Option<DisplayId> {
+        let here = self.area;
+        let (cx, cy) = here.center();
+        self.others
+            .iter()
+            .filter(|(_, s)| !s.tree.windows().is_empty())
+            .filter(|(_, s)| {
+                let a = s.area;
+                match dir {
+                    Direction::Left => a.x + a.w <= here.x,
+                    Direction::Right => a.x >= here.x + here.w,
+                    Direction::Up => a.y + a.h <= here.y,
+                    Direction::Down => a.y >= here.y + here.h,
+                }
+            })
+            .map(|(&d, s)| {
+                let (x, y) = s.area.center();
+                (d, (x - cx).powi(2) + (y - cy).powi(2))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(d, _)| d)
+    }
+
+    /// Makes `id` the working display and focuses its focused window (or
+    /// its first one). A display without tiled windows is left alone.
+    fn focus_display(&mut self, id: DisplayId) -> Result<(), String> {
+        let back = self.display;
+        self.enter_display(id);
+        let win = self
+            .focused
+            .filter(|w| self.tree.contains(*w))
+            .or_else(|| self.tree.windows().first().copied());
+        let Some(win) = win else {
+            self.enter_display(back);
+            return Err("no window on that display".into());
+        };
+        self.backend.focus(win);
+        self.focused = Some(win);
+        self.warp_to(win);
+        Ok(())
+    }
+
     /// The windows in the layouts of the displays that are not the working
     /// one (the Space on screen of each).
     fn tiled_on_other_displays(&self) -> Vec<WinId> {
@@ -1824,8 +1896,17 @@ impl<B: Backend> Manager<B> {
     pub fn execute(&mut self, cmd: &Command) -> Result<String, String> {
         // The user may have switched windows since the last poll.
         self.sync_focus();
-        // Commands act on the display of the focused window.
-        if let Some(d) = self.reported_focus.and_then(|f| self.display_with(f)) {
+        // Commands act on the display of the focused window, or on the one
+        // under the pointer (when it is over one) if the user prefers.
+        let under_pointer = if self.config.commands_follow_cursor {
+            self.backend
+                .cursor()
+                .and_then(|(x, y)| self.display_at_point(x, y))
+        } else {
+            None
+        };
+        let of_focus = || self.reported_focus.and_then(|f| self.display_with(f));
+        if let Some(d) = under_pointer.or_else(of_focus) {
             self.enter_display(d);
         }
         let focused_result = self
@@ -1836,11 +1917,39 @@ impl<B: Backend> Manager<B> {
         match *cmd {
             Command::Focus(dir) => {
                 let from = focused()?;
-                let to =
-                    bsp::neighbor(&self.slots(), from, dir).ok_or("no window in that direction")?;
-                self.backend.focus(to);
-                self.focused = Some(to);
-                self.warp_to(to);
+                if let Some(to) = bsp::neighbor(&self.slots(), from, dir) {
+                    self.backend.focus(to);
+                    self.focused = Some(to);
+                    self.warp_to(to);
+                } else {
+                    // At the edge of the display: carry on into the next one.
+                    let next = self
+                        .adjacent_display(dir)
+                        .ok_or("no window in that direction")?;
+                    self.focus_display(next)?;
+                    return Ok(String::new());
+                }
+            }
+            Command::Display(target) => {
+                let id = self.resolve_display(target)?;
+                self.focus_display(id)?;
+                return Ok(String::new());
+            }
+            Command::SendDisplay(target) => {
+                let win = focused()?;
+                let to = self.resolve_display(target)?;
+                let from = self.display;
+                if to == from {
+                    return Err("the window is already on that display".into());
+                }
+                self.enter_display(to);
+                self.move_to_display(win, from, None, None);
+                // Placed at once: the poll assigns windows to displays by
+                // their centre, which a slide would cross half way.
+                self.relayout_now();
+                self.backend.focus(win);
+                self.warp_to(win);
+                return Ok(String::new());
             }
             Command::Swap(dir) => {
                 let from = focused()?;
@@ -4323,6 +4432,76 @@ pub(crate) mod tests {
         let (a, b) = (m.backend().frame(1), m.backend().frame(3));
         assert!(a.x >= 1000 && b.x >= 1000, "both on the second display");
         assert!(a.w < 800 && b.w < 800, "and sharing it");
+    }
+
+    #[test]
+    fn display_commands_focus_the_other_display() {
+        let mut m = two_and_one();
+        m.backend.focused = Some(1);
+        m.execute(&Command::Display(DisplayTarget::Next)).unwrap();
+        assert_eq!(m.backend.focused, Some(3));
+        // Back again, by number and by prev.
+        m.execute(&Command::Display(DisplayTarget::Number(1)))
+            .unwrap();
+        assert!(matches!(m.backend.focused, Some(1 | 2)));
+        m.backend.focused = Some(3);
+        m.execute(&Command::Display(DisplayTarget::Prev)).unwrap();
+        assert!(matches!(m.backend.focused, Some(1 | 2)));
+        assert!(m.execute(&Command::Display(DisplayTarget::Number(3))).is_err());
+    }
+
+    #[test]
+    fn focus_crosses_to_the_next_display_at_the_edge() {
+        let mut m = two_and_one();
+        let rightmost = if m.backend().frame(1).x > m.backend().frame(2).x {
+            1
+        } else {
+            2
+        };
+        m.backend.focused = Some(rightmost);
+        m.execute(&Command::Focus(Direction::Right)).unwrap();
+        assert_eq!(m.backend.focused, Some(3));
+        // Nothing lies beyond the second display.
+        assert!(m.execute(&Command::Focus(Direction::Right)).is_err());
+        m.execute(&Command::Focus(Direction::Left)).unwrap();
+        assert!(matches!(m.backend.focused, Some(1 | 2)));
+    }
+
+    #[test]
+    fn send_display_moves_the_focused_window_to_the_other_layout() {
+        let mut m = two_and_one();
+        let sent = 2;
+        m.backend.focused = Some(sent);
+        m.execute(&Command::SendDisplay(DisplayTarget::Next))
+            .unwrap();
+        // The system now reports it on the second display.
+        put_on_second(&mut m, sent);
+        settle(&mut m);
+        m.refresh();
+        settle(&mut m);
+
+        assert_eq!(m.backend().frame(1), Rect::new(0, 25, 1000, 600));
+        let (a, b) = (m.backend().frame(sent), m.backend().frame(3));
+        assert!(a.x >= 1000 && b.x >= 1000, "both on the second display");
+        assert!(a.w < 800 && b.w < 800, "and sharing it");
+        assert_eq!(m.backend.focused, Some(sent));
+        assert!(
+            m.execute(&Command::SendDisplay(DisplayTarget::Number(2)))
+                .is_err(),
+            "already there"
+        );
+    }
+
+    #[test]
+    fn commands_can_follow_the_pointer_instead_of_the_focus() {
+        let mut m = two_and_one();
+        m.config.commands_follow_cursor = true;
+        m.backend.focused = Some(3);
+        m.backend.cursor = (100.0, 300.0);
+        let _ = m.execute(&Command::Balance);
+        let tiled = m.tree().windows();
+        assert_eq!(tiled.len(), 2, "the display under the pointer");
+        assert!(!tiled.contains(&3));
     }
 
     #[test]

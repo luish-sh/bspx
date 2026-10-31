@@ -117,6 +117,8 @@ If windows stop moving after an update, macOS has dropped the permission for the
 | `bspx space <space>` | Switch to a Space |
 | `bspx layout <space> bsp\|float` | Tile a Space, or leave its windows where you put them |
 | `bspx send <space>` | Move the focused window to a Space |
+| `bspx display <next\|prev\|n>` | Focus a window on another display (numbered from 1, left to right). `bspx focus` also crosses to the next display at the edge |
+| `bspx send-display <next\|prev\|n>` | Move the focused window to another display's layout |
 | `bspx reload` | Reload the config |
 | `bspx install` | Install the login service |
 | `bspx start` / `stop` / `restart` | Control the service |
@@ -255,6 +257,7 @@ bspx reload
 | `mouse_action2` | Right-drag with the modifier: `move` or `resize` | `resize` |
 | `mouse_follows_focus` | Move the pointer to windows focused from the keyboard, `on` / `off` | `off` |
 | `focus_follows_mouse` | Focus the window under the pointer, `on` / `off` | `off` |
+| `commands_follow_cursor` | Commands act on the display under the pointer instead of the one with the focused window, `on` / `off` | `off` |
 | `log_level` | `error`, `warn`, `info` or `debug`; try `debug` when something misbehaves | `info` |
 
 `bspx rule float "<app>"` keeps an app's windows out of the layout. In rules, use the app name exactly as `bspx query` shows it; on a non-English Mac it is the localized name (e.g. `"Sistem Ayarları"`). The built-in float rules use the English names (System Settings, Calculator, Archive Utility), so add your own with the local names.
