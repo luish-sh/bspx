@@ -347,62 +347,195 @@ fn cg_to_rect(r: CGRect) -> Rect {
     )
 }
 
-/// The primary display's frame and its visible frame (menu bar and Dock
-/// excluded), both in CoreGraphics coordinates (top-left origin).
-fn primary_screen_area() -> Option<Rect> {
-    type MsgSendId = unsafe extern "C" fn(Id, Sel) -> Id;
-    type MsgSendIndex = unsafe extern "C" fn(Id, Sel, usize) -> Id;
-    type MsgSendUsize = unsafe extern "C" fn(Id, Sel) -> usize;
+/// One attached display, in CoreGraphics coordinates (top-left origin).
+// The fields beyond `visible` are consumed by the later multi-display phases.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Screen {
+    /// The `CGDirectDisplayID` behind this screen.
+    display_id: CGDirectDisplayID,
+    /// The whole screen.
+    frame: Rect,
+    /// The screen minus the menu bar and the Dock (as AppKit last saw them).
+    visible: Rect,
+}
 
-    unsafe fn rect_of(obj: Id, sel: Sel) -> CGRect {
-        #[cfg(target_arch = "x86_64")]
-        {
-            type Stret = unsafe extern "C" fn(*mut CGRect, Id, Sel);
-            let f: Stret =
-                unsafe { std::mem::transmute(objc_msgSend_stret as unsafe extern "C" fn()) };
-            let mut out = CGRect::default();
-            unsafe { f(&mut out, obj, sel) };
-            out
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            type Ret = unsafe extern "C" fn(Id, Sel) -> CGRect;
-            let f: Ret = unsafe { std::mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
-            unsafe { f(obj, sel) }
-        }
+/// Converts a Cocoa rect (bottom-left origin, shared by all screens at the
+/// primary screen's bottom-left corner) to CoreGraphics coordinates. Every
+/// screen must be flipped against the *primary* screen's height, not its
+/// own: secondary screens sit at arbitrary, possibly negative, offsets.
+fn cocoa_to_cg(primary_height: f64, r: CGRect) -> Rect {
+    Rect::new(
+        r.origin.x.round() as i32,
+        (primary_height - (r.origin.y + r.size.height)).round() as i32,
+        r.size.width.round() as i32,
+        r.size.height.round() as i32,
+    )
+}
+
+/// `objc_msgSend` cast to the signatures used for reading `NSScreen`s.
+type MsgSendId = unsafe extern "C" fn(Id, Sel) -> Id;
+type MsgSendIdArg = unsafe extern "C" fn(Id, Sel, Id) -> Id;
+type MsgSendCStr = unsafe extern "C" fn(Id, Sel, *const c_char) -> Id;
+type MsgSendIndex = unsafe extern "C" fn(Id, Sel, usize) -> Id;
+type MsgSendUsize = unsafe extern "C" fn(Id, Sel) -> usize;
+type MsgSendU32 = unsafe extern "C" fn(Id, Sel) -> u32;
+
+/// Reads a `CGRect`-returning property such as `-[NSScreen frame]`.
+unsafe fn rect_of(obj: Id, sel: Sel) -> CGRect {
+    #[cfg(target_arch = "x86_64")]
+    {
+        type Stret = unsafe extern "C" fn(*mut CGRect, Id, Sel);
+        let f: Stret = unsafe { std::mem::transmute(objc_msgSend_stret as unsafe extern "C" fn()) };
+        let mut out = CGRect::default();
+        unsafe { f(&mut out, obj, sel) };
+        out
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        type Ret = unsafe extern "C" fn(Id, Sel) -> CGRect;
+        let f: Ret = unsafe { std::mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
+        unsafe { f(obj, sel) }
+    }
+}
 
+/// `[[screen deviceDescription] objectForKey:@"NSScreenNumber"]`, the
+/// screen's `CGDirectDisplayID`. Must be called inside an autorelease pool.
+unsafe fn screen_number(screen: Id) -> Option<CGDirectDisplayID> {
+    unsafe {
+        let send_id: MsgSendId = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let send_id_arg: MsgSendIdArg = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let send_cstr: MsgSendCStr = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let send_u32: MsgSendU32 = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+
+        let description = send_id(screen, sel_registerName(c"deviceDescription".as_ptr()));
+        let string_class = objc_getClass(c"NSString".as_ptr());
+        if description.is_null() || string_class.is_null() {
+            return None;
+        }
+        let key = send_cstr(
+            string_class,
+            sel_registerName(c"stringWithUTF8String:".as_ptr()),
+            c"NSScreenNumber".as_ptr(),
+        );
+        let number = send_id_arg(
+            description,
+            sel_registerName(c"objectForKey:".as_ptr()),
+            key,
+        );
+        if number.is_null() {
+            return None;
+        }
+        Some(send_u32(
+            number,
+            sel_registerName(c"unsignedIntValue".as_ptr()),
+        ))
+    }
+}
+
+/// Every attached screen, primary first. Displays come and go, so ask
+/// again whenever the current set matters rather than caching the result.
+fn screens() -> Vec<Screen> {
     unsafe {
         let send_id: MsgSendId = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
         let send_index: MsgSendIndex = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
         let send_usize: MsgSendUsize = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
 
         let pool = objc_autoreleasePoolPush();
-        let result = (|| {
-            let class = objc_getClass(c"NSScreen".as_ptr());
-            if class.is_null() {
-                return None;
-            }
-            let screens = send_id(class, sel_registerName(c"screens".as_ptr()));
-            if screens.is_null() || send_usize(screens, sel_registerName(c"count".as_ptr())) == 0 {
-                return None;
-            }
+        let mut out = Vec::new();
+        let class = objc_getClass(c"NSScreen".as_ptr());
+        if !class.is_null() {
+            let array = send_id(class, sel_registerName(c"screens".as_ptr()));
+            let count = if array.is_null() {
+                0
+            } else {
+                send_usize(array, sel_registerName(c"count".as_ptr()))
+            };
             // Index 0 is the screen with the menu bar, whose bottom-left
             // corner is the origin of Cocoa's global coordinates.
-            let primary = send_index(screens, sel_registerName(c"objectAtIndex:".as_ptr()), 0);
-            let frame = rect_of(primary, sel_registerName(c"frame".as_ptr()));
-            let visible = rect_of(primary, sel_registerName(c"visibleFrame".as_ptr()));
-            // Flip to top-left origin.
-            let top = frame.size.height - (visible.origin.y + visible.size.height);
-            Some(Rect::new(
-                visible.origin.x.round() as i32,
-                top.round() as i32,
-                visible.size.width.round() as i32,
-                visible.size.height.round() as i32,
-            ))
-        })();
+            let mut primary_height = 0.0;
+            for i in 0..count {
+                let screen = send_index(array, sel_registerName(c"objectAtIndex:".as_ptr()), i);
+                if screen.is_null() {
+                    continue;
+                }
+                let frame = rect_of(screen, sel_registerName(c"frame".as_ptr()));
+                let visible = rect_of(screen, sel_registerName(c"visibleFrame".as_ptr()));
+                if i == 0 {
+                    primary_height = frame.size.height;
+                }
+                let Some(display_id) = screen_number(screen) else {
+                    continue;
+                };
+                let frame = cocoa_to_cg(primary_height, frame);
+                let visible = cocoa_to_cg(primary_height, visible);
+                if frame.w > 0 && frame.h > 0 {
+                    out.push(Screen {
+                        display_id,
+                        frame,
+                        visible,
+                    });
+                }
+            }
+        }
         objc_autoreleasePoolPop(pool);
-        result.filter(|r| r.w > 0 && r.h > 0)
+        out
+    }
+}
+
+/// The primary display's visible frame (menu bar and Dock excluded), in
+/// CoreGraphics coordinates (top-left origin).
+fn primary_screen_area() -> Option<Rect> {
+    screens()
+        .first()
+        .map(|s| s.visible)
+        .filter(|r| r.w > 0 && r.h > 0)
+}
+
+#[cfg(test)]
+mod screen_tests {
+    use super::*;
+
+    fn cg(x: f64, y: f64, w: f64, h: f64) -> CGRect {
+        CGRect {
+            origin: CGPoint { x, y },
+            size: CGSize {
+                width: w,
+                height: h,
+            },
+        }
+    }
+
+    fn tuple(r: Rect) -> (i32, i32, i32, i32) {
+        (r.x, r.y, r.w, r.h)
+    }
+
+    #[test]
+    fn primary_visible_frame_is_flipped_below_the_menu_bar() {
+        // 1440x900 screen with a 25pt menu bar: Cocoa's visible frame starts
+        // at the bottom and is 875 tall, so its CG top is 25.
+        let r = cocoa_to_cg(900.0, cg(0.0, 0.0, 1440.0, 875.0));
+        assert_eq!(tuple(r), (0, 25, 1440, 875));
+    }
+
+    #[test]
+    fn screen_to_the_right_keeps_its_height_offset() {
+        // A 1920x1080 screen to the right whose bottom aligns with the
+        // primary's bottom (900 tall): it extends above the primary's top.
+        let r = cocoa_to_cg(900.0, cg(1440.0, 0.0, 1920.0, 1080.0));
+        assert_eq!(tuple(r), (1440, -180, 1920, 1080));
+    }
+
+    #[test]
+    fn screen_above_has_negative_cg_y() {
+        let r = cocoa_to_cg(900.0, cg(0.0, 900.0, 1440.0, 900.0));
+        assert_eq!(tuple(r), (0, -900, 1440, 900));
+    }
+
+    #[test]
+    fn screen_to_the_left_has_negative_x() {
+        let r = cocoa_to_cg(900.0, cg(-1920.0, 100.0, 1920.0, 1080.0));
+        assert_eq!(tuple(r), (-1920, -280, 1920, 1080));
     }
 }
 
@@ -621,12 +754,19 @@ impl MacBackend {
     }
 }
 
-/// The main display's UUID, as the Space functions name displays.
-fn main_display_uuid() -> Option<Cf> {
+/// A display's UUID string, as the Space functions name displays.
+// Only the main display is looked up until the multi-display phases land.
+#[allow(dead_code)]
+fn display_uuid(display: CGDirectDisplayID) -> Option<Cf> {
     unsafe {
-        let uuid = Cf::owned(CGDisplayCreateUUIDFromDisplayID(CGMainDisplayID()))?;
+        let uuid = Cf::owned(CGDisplayCreateUUIDFromDisplayID(display))?;
         Cf::owned(CFUUIDCreateString(ptr::null(), uuid.ptr()))
     }
+}
+
+/// The main display's UUID, as the Space functions name displays.
+fn main_display_uuid() -> Option<Cf> {
+    display_uuid(unsafe { CGMainDisplayID() })
 }
 
 /// Looks up a function in the loaded frameworks. `T` must be the
@@ -707,6 +847,70 @@ impl DockApi {
             DockEdge::Left | DockEdge::Right => r.w,
         };
         DockState::Shown(Dock { edge, thickness })
+    }
+
+    /// The area windows may use on `screen`: its frame minus the menu bar
+    /// and, only when it is on this screen, the Dock. Also returns what
+    /// the Dock was doing, for logging.
+    fn screen_area(&self, connection: i32, screen: &Screen) -> (Rect, DockState) {
+        let dock = self.state(connection, screen.frame);
+        (area_with_dock(screen, dock), dock)
+    }
+}
+
+/// `screen`'s usable area given the Dock's state.
+fn area_with_dock(screen: &Screen, dock: DockState) -> Rect {
+    match dock {
+        DockState::Shown(d) => usable_area(screen.frame, screen.visible, Some(d)),
+        DockState::Hidden | DockState::Elsewhere => usable_area(screen.frame, screen.visible, None),
+        DockState::Unknown => screen.visible,
+    }
+}
+
+#[cfg(test)]
+mod dock_area_tests {
+    use super::*;
+
+    fn screen(frame: Rect, visible: Rect) -> Screen {
+        Screen {
+            display_id: 0,
+            frame,
+            visible,
+        }
+    }
+
+    #[test]
+    fn a_dock_on_another_screen_leaves_this_one_whole_below_the_menu_bar() {
+        // A secondary screen to the right, without a menu bar of its own
+        // being relevant: the Dock lives elsewhere, so only the visible
+        // frame's top edge matters.
+        let frame = Rect::new(1440, 0, 1920, 1080);
+        let s = screen(frame, frame);
+        assert_eq!(area_with_dock(&s, DockState::Elsewhere), frame);
+    }
+
+    #[test]
+    fn a_dock_on_this_screen_is_kept_clear() {
+        let frame = Rect::new(1440, 0, 1920, 1080);
+        let s = screen(frame, frame);
+        let dock = Dock {
+            edge: DockEdge::Bottom,
+            thickness: 70,
+        };
+        let area = area_with_dock(&s, DockState::Shown(dock));
+        assert_eq!(area.x, 1440);
+        assert_eq!(area.w, 1920);
+        assert_eq!(area.max_y(), 1080 - 70);
+    }
+
+    #[test]
+    fn an_unknown_dock_trusts_the_visible_frame() {
+        let frame = Rect::new(0, 0, 1440, 900);
+        let visible = Rect::new(0, 25, 1440, 800);
+        assert_eq!(
+            area_with_dock(&screen(frame, visible), DockState::Unknown),
+            visible
+        );
     }
 }
 
@@ -1063,12 +1267,12 @@ impl Backend for MacBackend {
             warn!("NSScreen unavailable; assuming a 25pt menu bar");
             Rect::new(full.x, full.y + 25, full.w, full.h - 25)
         });
-        let dock = self.dock.state(self.connection, full);
-        let area = match dock {
-            DockState::Shown(d) => usable_area(full, visible, Some(d)),
-            DockState::Hidden | DockState::Elsewhere => usable_area(full, visible, None),
-            DockState::Unknown => visible,
+        let screen = Screen {
+            display_id: unsafe { CGMainDisplayID() },
+            frame: full,
+            visible,
         };
+        let (area, dock) = self.dock.screen_area(self.connection, &screen);
         if area != self.area {
             info!("tiling area {area:?} (dock: {dock:?}, visible frame: {visible:?})");
             self.area = area;
