@@ -22,9 +22,58 @@ pub struct WindowInfo {
     pub movable: bool,
 }
 
+/// Identifies a display. A backend with a single display uses 0.
+pub type DisplayId = u32;
+
+/// One display that can be tiled.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Display {
+    pub id: DisplayId,
+    /// The usable area (menu bar and Dock excluded), in window coordinates.
+    pub area: Rect,
+}
+
+/// The display a window is on: the one holding the window's centre. A window
+/// whose centre is on none (it straddles a gap) goes to the first display.
+pub fn display_at(displays: &[Display], frame: Rect) -> Option<DisplayId> {
+    let (cx, cy) = frame.center();
+    displays
+        .iter()
+        .find(|d| d.area.contains_point(cx, cy))
+        .or_else(|| displays.first())
+        .map(|d| d.id)
+}
+
 pub trait Backend {
     /// All windows on screen: those on the active Space of the tiled display.
     fn windows(&mut self) -> Vec<WindowInfo>;
+    /// Every display to tile, the primary one first.
+    fn displays(&mut self) -> Vec<Display> {
+        vec![Display {
+            id: 0,
+            area: self.tiling_area(),
+        }]
+    }
+    /// The Space shown on a display.
+    fn display_active_space(&mut self, _display: DisplayId) -> u64 {
+        self.active_space()
+    }
+    /// The Spaces of a display, in Mission Control order.
+    fn display_spaces(&mut self, _display: DisplayId) -> Vec<u64> {
+        self.spaces()
+    }
+    /// Switches a display to its Space n (numbered from 1).
+    fn switch_display_to_space(&mut self, _display: DisplayId, n: usize) -> Result<(), String> {
+        self.switch_to_space(n)
+    }
+    /// The display each window is on.
+    fn window_displays(&mut self, windows: &[WindowInfo]) -> HashMap<WinId, DisplayId> {
+        let displays = self.displays();
+        windows
+            .iter()
+            .filter_map(|w| display_at(&displays, w.frame).map(|d| (w.id, d)))
+            .collect()
+    }
     /// The Space (virtual desktop) shown on the tiled display.
     fn active_space(&mut self) -> u64 {
         0
@@ -181,4 +230,41 @@ pub struct Overlay {
     pub above: WinId,
     /// RGBA, 0..=1.
     pub color: [f32; 4],
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    fn two() -> Vec<Display> {
+        vec![
+            Display {
+                id: 1,
+                area: Rect::new(0, 25, 1000, 775),
+            },
+            Display {
+                id: 2,
+                area: Rect::new(1000, 0, 800, 600),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_window_belongs_to_the_display_holding_its_centre() {
+        let d = two();
+        assert_eq!(display_at(&d, Rect::new(100, 100, 200, 200)), Some(1));
+        assert_eq!(display_at(&d, Rect::new(1100, 100, 200, 200)), Some(2));
+        // Mostly on the second display.
+        assert_eq!(display_at(&d, Rect::new(900, 100, 600, 200)), Some(2));
+    }
+
+    #[test]
+    fn a_window_in_no_display_goes_to_the_first() {
+        assert_eq!(display_at(&two(), Rect::new(5000, 5000, 100, 100)), Some(1));
+    }
+
+    #[test]
+    fn no_displays_means_no_answer() {
+        assert_eq!(display_at(&[], Rect::new(0, 0, 10, 10)), None);
+    }
 }

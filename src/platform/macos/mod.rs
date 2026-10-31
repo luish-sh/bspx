@@ -15,7 +15,9 @@ use log::{debug, info, warn};
 
 use self::ffi::*;
 use self::overlay::OverlayWindow;
-use super::{Backend, Modifier, MouseButton, Overlay, WindowEvent, WindowInfo};
+use super::{
+    Backend, Display, DisplayId, Modifier, MouseButton, Overlay, WindowEvent, WindowInfo,
+};
 use crate::bsp::WinId;
 use crate::geometry::{Dock, DockEdge, Rect, usable_area};
 
@@ -755,18 +757,11 @@ impl MacBackend {
 }
 
 /// A display's UUID string, as the Space functions name displays.
-// Only the main display is looked up until the multi-display phases land.
-#[allow(dead_code)]
 fn display_uuid(display: CGDirectDisplayID) -> Option<Cf> {
     unsafe {
         let uuid = Cf::owned(CGDisplayCreateUUIDFromDisplayID(display))?;
         Cf::owned(CFUUIDCreateString(ptr::null(), uuid.ptr()))
     }
-}
-
-/// The main display's UUID, as the Space functions name displays.
-fn main_display_uuid() -> Option<Cf> {
-    display_uuid(unsafe { CGMainDisplayID() })
 }
 
 /// Looks up a function in the loaded frameworks. `T` must be the
@@ -1293,18 +1288,38 @@ impl Backend for MacBackend {
         self.write_frame(id, frame, moved, resized, !grows);
     }
 
-    fn active_space(&mut self) -> u64 {
-        // The Space on the main display, the one bspx tiles. The system-wide
-        // "active" Space follows focus to other displays instead.
-        unsafe {
-            let space = main_display_uuid().map_or(0, |n| {
-                CGSManagedDisplayGetCurrentSpace(self.connection, n.ptr())
+    fn displays(&mut self) -> Vec<Display> {
+        let mut out: Vec<Display> = screens()
+            .iter()
+            .map(|screen| Display {
+                id: screen.display_id,
+                area: self.dock.screen_area(self.connection, screen).0,
+            })
+            .collect();
+        if out.is_empty() {
+            out.push(Display {
+                id: unsafe { CGMainDisplayID() },
+                area: self.tiling_area(),
             });
-            if space != 0 {
-                space
-            } else {
-                CGSGetActiveSpace(self.connection)
-            }
+        }
+        out
+    }
+
+    fn active_space(&mut self) -> u64 {
+        self.display_active_space(unsafe { CGMainDisplayID() })
+    }
+
+    fn display_active_space(&mut self, display: DisplayId) -> u64 {
+        // The Space on that display. The system-wide "active" Space follows
+        // focus to other displays instead, so it only stands in for the main
+        // display, never for another one.
+        let space = display_uuid(display).map_or(0, |uuid| unsafe {
+            CGSManagedDisplayGetCurrentSpace(self.connection, uuid.ptr())
+        });
+        if space == 0 && display == unsafe { CGMainDisplayID() } {
+            unsafe { CGSGetActiveSpace(self.connection) }
+        } else {
+            space
         }
     }
 
@@ -1353,12 +1368,25 @@ impl Backend for MacBackend {
     }
 
     fn spaces(&mut self) -> Vec<u64> {
-        let display = main_display_uuid().and_then(|u| string_value(u.ptr()));
-        let mut spaces = self.space_api.spaces(self.connection, display.as_deref());
+        self.display_spaces(unsafe { CGMainDisplayID() })
+    }
+
+    fn display_spaces(&mut self, display: DisplayId) -> Vec<u64> {
+        let uuid = display_uuid(display).and_then(|u| string_value(u.ptr()));
+        let mut spaces = self.space_api.spaces(self.connection, uuid.as_deref());
         if spaces.is_empty() {
-            spaces.push(self.active_space());
+            spaces.push(self.display_active_space(display));
         }
         spaces
+    }
+
+    fn switch_display_to_space(&mut self, display: DisplayId, n: usize) -> Result<(), String> {
+        // `desktop::switch` drives the main display only.
+        if display == unsafe { CGMainDisplayID() } {
+            desktop::switch(n)
+        } else {
+            Err("switching Spaces on another display is not supported yet".into())
+        }
     }
 
     fn move_to_space(&mut self, id: WinId, space: u64) -> bool {
