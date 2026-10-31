@@ -54,6 +54,11 @@ pub trait Backend {
             area: self.tiling_area(),
         }]
     }
+    /// The windows on screen on one display. A single-display backend has
+    /// all of its windows there.
+    fn display_windows(&mut self, _display: DisplayId) -> Vec<WindowInfo> {
+        self.windows()
+    }
     /// The Space shown on a display.
     fn display_active_space(&mut self, _display: DisplayId) -> u64 {
         self.active_space()

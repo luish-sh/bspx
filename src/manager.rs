@@ -9,7 +9,9 @@ use crate::bsp::{self, BspTree, MinSizes, WinId};
 use crate::command::{Command, Zoom};
 use crate::config::{Config, MouseAction, app_matches};
 use crate::geometry::{Direction, Rect};
-use crate::platform::{Backend, Modifier, MouseButton, Overlay, WindowEvent, WindowInfo};
+use crate::platform::{
+    Backend, DisplayId, Modifier, MouseButton, Overlay, WindowEvent, WindowInfo,
+};
 
 /// The layout of a Space (virtual desktop) that is not on screen.
 #[derive(Debug, Default)]
@@ -19,12 +21,45 @@ struct SpaceState {
     zoomed: Option<(WinId, Zoom)>,
 }
 
+/// What a display that is not the working one holds: the fields `Manager`
+/// keeps for the working display (`area`, `active_space`, `tree`, `focused`
+/// and `zoomed`), put away. `enter_display` swaps the two, the way
+/// `switch_space` swaps Spaces. Space ids are unique across displays, so
+/// the layouts of the Spaces not on screen stay together in `spaces`.
+#[derive(Debug, Default)]
+struct DisplayState {
+    area: Rect,
+    active_space: u64,
+    tree: BspTree,
+    focused: Option<WinId>,
+    zoomed: Option<(WinId, Zoom)>,
+}
+
+/// What every display's pass of `sync` shares.
+struct SyncView {
+    /// Windows that exist, on screen or not.
+    alive: HashSet<WinId>,
+    /// The Space each window is on.
+    spaces: HashMap<WinId, u64>,
+    /// Spaces left to float.
+    float_spaces: HashSet<u64>,
+    /// The Space on screen on each display.
+    shown: HashSet<u64>,
+    /// The window the system says has focus.
+    focused: Option<WinId>,
+}
+
 pub struct Manager<B: Backend> {
     backend: B,
     config: Config,
     /// Layout of the Space on screen; `spaces` holds the others.
     tree: BspTree,
     active_space: u64,
+    /// The display whose state the fields above (and `area`, `focused` and
+    /// `zoomed`) hold.
+    display: DisplayId,
+    /// The other displays' state, by display.
+    others: HashMap<DisplayId, DisplayState>,
     spaces: HashMap<u64, SpaceState>,
     anim: Animator,
     /// Last frame each window was seen at or sent to.
@@ -176,6 +211,8 @@ impl<B: Backend> Manager<B> {
             config,
             tree: BspTree::new(),
             active_space: 0,
+            display: 0,
+            others: HashMap::new(),
             spaces: HashMap::new(),
             anim,
             frames: HashMap::new(),
@@ -289,24 +326,50 @@ impl<B: Backend> Manager<B> {
     /// `refresh`, optionally without learning minimum sizes (the frames
     /// right after a mouse resize are the user's, not the app's limits).
     fn sync(&mut self, learn: bool) {
-        let mut dirty = false;
-
-        let area = self.backend.tiling_area();
-        if area != self.area {
-            self.area = area;
-            dirty = true;
+        let displays = self.backend.displays();
+        let Some(first) = displays.first().copied() else {
+            return;
+        };
+        if !displays.iter().any(|d| d.id == self.display) {
+            // The first poll, or the display bspx was working on went away.
+            if self.others.contains_key(&first.id) {
+                self.enter_display(first.id);
+            } else {
+                self.display = first.id;
+            }
         }
+        let current = self.display;
 
-        let space = self.backend.active_space();
-        if space != self.active_space {
-            self.switch_space(space);
-            dirty = true;
+        // Every display's area and Space first: a Space switch puts the old
+        // layout away, and the focus lookup below goes through all layouts.
+        let mut shown: HashMap<DisplayId, u64> = HashMap::new();
+        let mut changed: HashMap<DisplayId, bool> = HashMap::new();
+        for d in &displays {
+            self.enter_display(d.id);
+            let mut dirty = false;
+            if d.area != self.area {
+                self.area = d.area;
+                dirty = true;
+            }
+            let space = self.backend.display_active_space(d.id);
+            if space != self.active_space {
+                self.switch_space(space);
+                dirty = true;
+            }
+            shown.insert(d.id, space);
+            changed.insert(d.id, dirty);
         }
 
         let focused_now = self.sync_focus();
 
-        let windows = self.backend.windows();
-        let on_screen: HashSet<WinId> = windows.iter().map(|w| w.id).collect();
+        let per_display: Vec<(DisplayId, Vec<WindowInfo>)> = displays
+            .iter()
+            .map(|d| (d.id, self.backend.display_windows(d.id)))
+            .collect();
+        let on_screen: HashSet<WinId> = per_display
+            .iter()
+            .flat_map(|(_, ws)| ws.iter().map(|w| w.id))
+            .collect();
         let alive = self
             .backend
             .alive_windows()
@@ -316,6 +379,7 @@ impl<B: Backend> Manager<B> {
         // what is on screen: right after a Space switch the screen still
         // shows the old Space's windows for a moment.
         let mut ids: Vec<WinId> = self.all_tiled().into_iter().map(|(_, id)| id).collect();
+        ids.extend(self.tiled_on_other_displays());
         let extra: Vec<WinId> = on_screen
             .iter()
             .copied()
@@ -323,6 +387,73 @@ impl<B: Backend> Manager<B> {
             .collect();
         ids.extend(extra);
         let spaces = self.backend.window_spaces(&ids);
+
+        let float_spaces = self.float_space_ids();
+        self.spaces.retain(|s, _| !float_spaces.contains(s));
+        self.floating.retain(|w| alive.contains(w));
+        if !self.synced {
+            self.synced = true;
+            self.seen.extend(alive.iter().copied());
+        }
+        self.seen.retain(|w| alive.contains(w));
+        self.closed.retain(|w| on_screen.contains(w));
+        self.frames.retain(|w, _| on_screen.contains(w));
+        self.apps.retain(|w, _| alive.contains(w));
+        self.min_sizes.retain(|w, _| alive.contains(w));
+        self.opened.retain(|w, _| alive.contains(w));
+
+        // Windows on screen, front to back, across every display.
+        self.stack = per_display
+            .iter()
+            .flat_map(|(_, ws)| ws.iter().map(|w| w.id))
+            .collect();
+        self.manageable = per_display
+            .iter()
+            .flat_map(|(_, ws)| ws.iter())
+            .filter(|w| w.tileable)
+            .map(|w| w.id)
+            .collect();
+
+        let view = SyncView {
+            alive,
+            spaces,
+            float_spaces,
+            shown: shown.values().copied().collect(),
+            focused: focused_now,
+        };
+        for (id, windows) in per_display {
+            self.enter_display(id);
+            let (space, dirty) = (shown[&id], changed[&id]);
+            self.sync_display(learn, space, windows, dirty, &view);
+        }
+
+        // Commands act on the display of the focused window.
+        let back = focused_now
+            .and_then(|f| self.display_with(f))
+            .unwrap_or(current);
+        let back = if displays.iter().any(|d| d.id == back) {
+            back
+        } else {
+            first.id
+        };
+        self.enter_display(back);
+        self.others
+            .retain(|id, _| displays.iter().any(|d| d.id == *id));
+    }
+
+    /// The part of `sync` that is about one display, which is the one
+    /// swapped in: its `windows`, and the Space `space` it shows.
+    fn sync_display(
+        &mut self,
+        learn: bool,
+        space: u64,
+        windows: Vec<WindowInfo>,
+        mut dirty: bool,
+        view: &SyncView,
+    ) {
+        let focused_now = view.focused;
+        let (alive, spaces, float_spaces) = (&view.alive, &view.spaces, &view.float_spaces);
+        let on_screen: HashSet<WinId> = windows.iter().map(|w| w.id).collect();
         let switching = windows
             .iter()
             .any(|w| spaces.get(&w.id).is_some_and(|s| *s != space))
@@ -330,7 +461,6 @@ impl<B: Backend> Manager<B> {
                 && !self.tree.windows().iter().any(|w| on_screen.contains(w)));
 
         // Floating Spaces have no layout; their windows stay where they are.
-        let float_spaces = self.float_space_ids();
         if float_spaces.contains(&space) && !self.tree.is_empty() {
             debug!("Space {space} floats: leaving its windows be");
             for id in self.tree.windows() {
@@ -340,7 +470,6 @@ impl<B: Backend> Manager<B> {
             self.zoomed = None;
             self.focused = None;
         }
-        self.spaces.retain(|s, _| !float_spaces.contains(s));
 
         let mut moved = Vec::new();
         for (tree_space, id) in self.all_tiled() {
@@ -366,9 +495,10 @@ impl<B: Backend> Manager<B> {
             }
         }
         // A window moved to another Space joins that Space's layout. One
-        // moved to this Space is picked up below, once it is on screen.
+        // moved to this Space, or to the Space of another display, is picked
+        // up once it is on screen (there, for the other display).
         for (s, id) in moved {
-            if s != space && !float_spaces.contains(&s) {
+            if s != space && !view.shown.contains(&s) && !float_spaces.contains(&s) {
                 let (inner, gap, ratio) =
                     (self.inner_area(), self.config.gap, self.config.split_ratio);
                 let state = self.spaces.entry(s).or_default();
@@ -376,17 +506,6 @@ impl<B: Backend> Manager<B> {
             }
         }
 
-        self.floating.retain(|w| alive.contains(w));
-        if !self.synced {
-            self.synced = true;
-            self.seen.extend(alive.iter().copied());
-        }
-        self.seen.retain(|w| alive.contains(w));
-        self.closed.retain(|w| on_screen.contains(w));
-        self.frames.retain(|w, _| on_screen.contains(w));
-        self.apps.retain(|w, _| alive.contains(w));
-        self.min_sizes.retain(|w, _| alive.contains(w));
-        self.opened.retain(|w, _| alive.contains(w));
         if self.focused.is_some_and(|f| !self.tree.contains(f)) {
             self.focused = None;
         }
@@ -401,12 +520,6 @@ impl<B: Backend> Manager<B> {
 
         // Open windows in the order the backend lists them, but put the
         // focused one last so it ends up next to where the user is looking.
-        self.stack = windows.iter().map(|w| w.id).collect();
-        self.manageable = windows
-            .iter()
-            .filter(|w| w.tileable)
-            .map(|w| w.id)
-            .collect();
         let mut new = Vec::new();
         for info in windows {
             self.opened.entry(info.id).or_insert(info.frame);
@@ -906,12 +1019,59 @@ impl<B: Backend> Manager<B> {
                     self.focus_moved = Some((prev, self.clock));
                 }
                 self.focused = Some(f);
+            } else if let Some(state) = now.and_then(|f| {
+                self.others
+                    .values_mut()
+                    .find(|s| s.tree.contains(f))
+                    .map(|s| (s, f))
+            }) {
+                // On another display.
+                state.0.focused = Some(state.1);
             }
         }
         now
     }
 
-    /// Every tiled window, with the Space whose layout it is in.
+    /// Makes `id` the working display, putting the current one away. A
+    /// display seen for the first time starts with no layout.
+    fn enter_display(&mut self, id: DisplayId) {
+        if id == self.display {
+            return;
+        }
+        let next = self.others.remove(&id).unwrap_or_default();
+        let prev = DisplayState {
+            area: std::mem::replace(&mut self.area, next.area),
+            active_space: std::mem::replace(&mut self.active_space, next.active_space),
+            tree: std::mem::replace(&mut self.tree, next.tree),
+            focused: std::mem::replace(&mut self.focused, next.focused),
+            zoomed: std::mem::replace(&mut self.zoomed, next.zoomed),
+        };
+        self.others.insert(self.display, prev);
+        self.display = id;
+    }
+
+    /// The display whose layout (of the Space on screen) holds window `id`.
+    fn display_with(&self, id: WinId) -> Option<DisplayId> {
+        if self.tree.contains(id) {
+            return Some(self.display);
+        }
+        self.others
+            .iter()
+            .find(|(_, s)| s.tree.contains(id))
+            .map(|(&d, _)| d)
+    }
+
+    /// The windows in the layouts of the displays that are not the working
+    /// one (the Space on screen of each).
+    fn tiled_on_other_displays(&self) -> Vec<WinId> {
+        self.others
+            .values()
+            .flat_map(|s| s.tree.windows())
+            .collect()
+    }
+
+    /// Every tiled window of the working display, with the Space whose
+    /// layout it is in.
     fn all_tiled(&self) -> Vec<(u64, WinId)> {
         let mut out: Vec<(u64, WinId)> = self
             .tree
@@ -926,7 +1086,9 @@ impl<B: Backend> Manager<B> {
     }
 
     fn is_tiled_anywhere(&self, id: WinId) -> bool {
-        self.tree.contains(id) || self.spaces.values().any(|s| s.tree.contains(id))
+        self.tree.contains(id)
+            || self.spaces.values().any(|s| s.tree.contains(id))
+            || self.others.values().any(|s| s.tree.contains(id))
     }
 
     fn remove_from_space(&mut self, space: u64, id: WinId) {
@@ -1561,6 +1723,10 @@ impl<B: Backend> Manager<B> {
     pub fn execute(&mut self, cmd: &Command) -> Result<String, String> {
         // The user may have switched windows since the last poll.
         self.sync_focus();
+        // Commands act on the display of the focused window.
+        if let Some(d) = self.reported_focus.and_then(|f| self.display_with(f)) {
+            self.enter_display(d);
+        }
         let focused_result = self
             .focused
             .ok_or_else(|| "no tiled window is focused".to_string());
@@ -1963,6 +2129,12 @@ pub(crate) mod tests {
         pub menu: Option<Rect>,
         /// Spotlight (or the like) is open.
         pub panel: bool,
+        /// Displays besides the main one (id 0, `area`, showing `active`).
+        pub extra_displays: Vec<crate::platform::Display>,
+        /// The Space each extra display shows.
+        pub display_space: HashMap<DisplayId, u64>,
+        /// The display each window is on; absent means the main one.
+        pub display_of: HashMap<WinId, DisplayId>,
     }
 
     impl MockBackend {
@@ -1987,13 +2159,36 @@ pub(crate) mod tests {
 
     impl Backend for MockBackend {
         fn windows(&mut self) -> Vec<WindowInfo> {
-            let shown = self.screen_space.unwrap_or(self.active);
+            self.display_windows(0)
+        }
+        fn displays(&mut self) -> Vec<crate::platform::Display> {
+            let mut out = vec![crate::platform::Display {
+                id: 0,
+                area: self.area,
+            }];
+            out.extend(self.extra_displays.iter().copied());
+            out
+        }
+        fn display_windows(&mut self, display: DisplayId) -> Vec<WindowInfo> {
+            let shown = if display == 0 {
+                self.screen_space.unwrap_or(self.active)
+            } else {
+                self.display_space.get(&display).copied().unwrap_or(0)
+            };
             self.windows
                 .iter()
+                .filter(|w| self.display_of.get(&w.id).copied().unwrap_or(0) == display)
                 .filter(|w| self.space_of.get(&w.id).copied().unwrap_or(0) == shown)
                 .filter(|w| !self.minimised.contains(&w.id))
                 .cloned()
                 .collect()
+        }
+        fn display_active_space(&mut self, display: DisplayId) -> u64 {
+            if display == 0 {
+                self.active
+            } else {
+                self.display_space.get(&display).copied().unwrap_or(0)
+            }
         }
         fn active_space(&mut self) -> u64 {
             self.active
@@ -3914,6 +4109,74 @@ pub(crate) mod tests {
 
     fn frames(m: &Manager<MockBackend>) -> Vec<Rect> {
         (1..=3).map(|id| m.backend().frame(id)).collect()
+    }
+
+    /// A second display, to the right of the main one, showing Space 7.
+    fn two_displays() -> Manager<MockBackend> {
+        let mut m = manager(0.0);
+        m.backend.extra_displays = vec![crate::platform::Display {
+            id: 1,
+            area: Rect::new(1000, 25, 800, 600),
+        }];
+        m.backend.display_space.insert(1, 7);
+        m
+    }
+
+    /// Opens window `id` on display 1 (Space 7).
+    fn open_on_second(m: &mut Manager<MockBackend>, id: WinId, app: &str) {
+        m.backend.open(id, app);
+        m.backend.space_of.insert(id, 7);
+        m.backend.display_of.insert(id, 1);
+        m.backend.windows.last_mut().unwrap().frame = Rect::new(1100, 100, 300, 200);
+    }
+
+    #[test]
+    fn each_display_tiles_its_own_windows() {
+        let mut m = two_displays();
+        m.backend.open(1, "Terminal");
+        open_on_second(&mut m, 2, "Safari");
+        m.refresh();
+        settle(&mut m);
+        assert_eq!(m.backend().frame(1), Rect::new(0, 25, 1000, 600));
+        assert_eq!(m.backend().frame(2), Rect::new(1000, 25, 800, 600));
+
+        // Polling again does not treat the other display's window as moved.
+        m.refresh();
+        m.refresh();
+        settle(&mut m);
+        assert_eq!(m.backend().frame(1), Rect::new(0, 25, 1000, 600));
+        assert_eq!(m.backend().frame(2), Rect::new(1000, 25, 800, 600));
+    }
+
+    #[test]
+    fn a_second_window_splits_only_its_own_display() {
+        let mut m = two_displays();
+        m.backend.open(1, "Terminal");
+        open_on_second(&mut m, 2, "Safari");
+        m.refresh();
+        open_on_second(&mut m, 3, "Mail");
+        m.refresh();
+        settle(&mut m);
+        assert_eq!(m.backend().frame(1), Rect::new(0, 25, 1000, 600));
+        let (a, b) = (m.backend().frame(2), m.backend().frame(3));
+        assert!(a.x >= 1000 && b.x >= 1000, "both stay on the second display");
+        assert!(a.w < 800 && b.w < 800, "and share it");
+    }
+
+    #[test]
+    fn commands_act_on_the_display_of_the_focused_window() {
+        let mut m = two_displays();
+        m.backend.open(1, "Terminal");
+        open_on_second(&mut m, 2, "Safari");
+        open_on_second(&mut m, 3, "Mail");
+        m.refresh();
+        settle(&mut m);
+        // Window 3 has focus, on the second display: its layout is the
+        // working one, so a command sees its neighbour there, not window 1.
+        assert_eq!(m.tree().windows().len(), 2);
+        m.backend.focused = Some(1);
+        let _ = m.execute(&Command::Balance);
+        assert_eq!(m.tree().windows(), vec![1]);
     }
 
     #[test]
