@@ -1050,6 +1050,65 @@ impl<B: Backend> Manager<B> {
         self.display = id;
     }
 
+    /// The display whose tiling area holds a point. The menu bar and Dock
+    /// are outside every area, so a pointer over them answers `None`.
+    fn display_at_point(&self, x: f32, y: f32) -> Option<DisplayId> {
+        if self.area.contains_point(x, y) {
+            return Some(self.display);
+        }
+        self.others
+            .iter()
+            .find(|(_, s)| s.area.contains_point(x, y))
+            .map(|(&d, _)| d)
+    }
+
+    /// Makes the display under a point the working one, if there is one.
+    fn enter_display_at(&mut self, x: f32, y: f32) {
+        if let Some(d) = self.display_at_point(x, y) {
+            self.enter_display(d);
+        }
+    }
+
+    /// Moves tiled window `win` from display `from` into the layout of the
+    /// working display, the one it was dropped on: beside `target` on
+    /// `side`, or splitting `target` (or the last window). The window is
+    /// already on the new display, so it slides from where it was let go.
+    fn move_to_display(
+        &mut self,
+        win: WinId,
+        from: DisplayId,
+        target: Option<WinId>,
+        side: Option<Direction>,
+    ) {
+        let to = self.display;
+        info!("moving window {win} from display {from} to display {to}");
+        self.enter_display(from);
+        self.tree.remove(win);
+        self.anim.cancel(win);
+        if self.focused == Some(win) {
+            self.focused = self.tree.windows().last().copied();
+        }
+        if self.zoomed.is_some_and(|(w, _)| w == win) {
+            self.zoomed = None;
+        }
+        self.relayout();
+        self.enter_display(to);
+        match (target.filter(|t| self.tree.contains(*t)), side) {
+            (Some(other), Some(side)) => {
+                self.tree.insert_at(win, other, side);
+            }
+            (target, _) => {
+                if !self.tile_where_it_fits(win, target) {
+                    self.float_in_the_middle(win);
+                    self.relayout();
+                    return;
+                }
+            }
+        }
+        self.focused = Some(win);
+        self.relayout();
+    }
+
     /// The display whose layout (of the Space on screen) holds window `id`.
     fn display_with(&self, id: WinId) -> Option<DisplayId> {
         if self.tree.contains(id) {
@@ -1173,6 +1232,10 @@ impl<B: Backend> Manager<B> {
             return;
         }
         self.hover = None;
+        // The window may be on another display than the working one.
+        if let Some(d) = self.display_with(win) {
+            self.enter_display(d);
+        }
         let tiled = self.tree.contains(win);
         if self.reported_focus == Some(win) {
             return;
@@ -1184,7 +1247,7 @@ impl<B: Backend> Manager<B> {
                 .stack
                 .iter()
                 .take_while(|id| **id != win)
-                .filter(|id| self.manageable.contains(id) && !self.tree.contains(**id))
+                .filter(|id| self.manageable.contains(id) && !self.is_tiled_anywhere(**id))
                 .find(|id| self.frames.get(id).is_some_and(|f| f.intersects(&frame)));
             if let Some(float) = buried {
                 debug!("focus follows mouse: window {win} would cover floating window {float}");
@@ -1250,6 +1313,10 @@ impl<B: Backend> Manager<B> {
     fn press(&mut self) {
         // Where everything was before the user touched it.
         self.before_drag.clone_from(&self.frames);
+        // The click is on the display under the pointer.
+        if let Some((x, y)) = self.backend.cursor() {
+            self.enter_display_at(x, y);
+        }
         let grabbed = self.backend.cursor().and_then(|(x, y)| {
             let hit = |id: &WinId| self.frames.get(id).is_some_and(|f| f.contains_point(x, y));
             // A zoomed window is in front of the ones it covers.
@@ -1294,6 +1361,8 @@ impl<B: Backend> Manager<B> {
                 let Some(cursor) = self.backend.cursor() else {
                     return;
                 };
+                // The drop target is on the display under the pointer.
+                self.enter_display_at(cursor.0, cursor.1);
                 let target = self.show_drop_target(win, (target, None), cursor, false).0;
                 self.drag = Drag::Moving { win, target };
             }
@@ -1304,7 +1373,7 @@ impl<B: Backend> Manager<B> {
     /// Whether the grabbed window can still be moved: a tiled one must still
     /// be in this Space's layout, any window must still be on screen.
     fn grab_is_valid(&self, grab: &Grab) -> bool {
-        self.stack.contains(&grab.win) && (!grab.tiled || self.tree.contains(grab.win))
+        self.stack.contains(&grab.win) && (!grab.tiled || self.display_with(grab.win).is_some())
     }
 
     /// The button went down with the modifier held: grab the window under
@@ -1321,6 +1390,11 @@ impl<B: Backend> Manager<B> {
             return;
         };
         let action = self.config.mouse_action(button);
+        // The grab belongs to the display the window is tiled on.
+        match self.display_with(win) {
+            Some(d) => self.enter_display(d),
+            None => self.enter_display_at(x, y),
+        }
         let tiled = self.tree.contains(win);
         if tiled && self.zoomed.is_some_and(|(w, _)| w == win) && action == MouseAction::Resize {
             // Resizing works on the split borders, which a zoom hides.
@@ -1370,6 +1444,12 @@ impl<B: Backend> Manager<B> {
             return;
         }
         grab.moved = true;
+        // A resize works on the layout the window is in; a move may roam.
+        if grab.action == MouseAction::Resize
+            && let Some(d) = self.display_with(grab.win)
+        {
+            self.enter_display(d);
+        }
         let f = grab.frame;
         match grab.action {
             MouseAction::Move => {
@@ -1384,6 +1464,8 @@ impl<B: Backend> Manager<B> {
                     .mouse_insert_modifier
                     .is_some_and(|k| self.backend.modifier_held(k));
                 if grab.tiled && (self.config.drag_swap || insert) {
+                    // The drop target is on the display under the pointer.
+                    self.enter_display_at(x, y);
                     (grab.target, grab.side) =
                         self.show_drop_target(grab.win, (grab.target, grab.side), (x, y), insert);
                 }
@@ -1456,6 +1538,13 @@ impl<B: Backend> Manager<B> {
         );
         if grab.action == MouseAction::Move && grab.tiled {
             self.set_overlay(None);
+            self.enter_display_at(pointer.0, pointer.1);
+            // Dropped on another display: the window changes layouts.
+            if let Some(from) = self.display_with(grab.win).filter(|d| *d != self.display) {
+                let target = grab.target.filter(|t| self.tree.contains(*t));
+                self.move_to_display(grab.win, from, target, grab.side);
+                return;
+            }
             let target = grab.target.filter(|t| self.tree.contains(*t));
             if let Some(other) = target.filter(|_| self.tree.contains(grab.win)) {
                 match grab.side {
@@ -1537,9 +1626,17 @@ impl<B: Backend> Manager<B> {
         match std::mem::replace(&mut self.drag, Drag::None) {
             Drag::Moving { win, target } => {
                 self.set_overlay(None);
+                if let Some((x, y)) = self.backend.cursor() {
+                    self.enter_display_at(x, y);
+                }
                 // Animate from where the user let go.
                 if let Some(now) = self.backend.window_frame(win) {
                     self.frames.insert(win, now);
+                }
+                // Dropped on another display: the window changes layouts.
+                if let Some(from) = self.display_with(win).filter(|d| *d != self.display) {
+                    self.move_to_display(win, from, target, None);
+                    return;
                 }
                 match target {
                     Some(other) => {
@@ -1552,8 +1649,12 @@ impl<B: Backend> Manager<B> {
             }
             _ => {
                 // A resize ends here: read where windows ended up, then
-                // turn the dragged edges into split borders.
+                // turn the dragged edges into split borders. `sync` leaves
+                // the display of the focused window working; this is the
+                // one the mouse went down on.
+                let display = self.display;
                 self.sync(false);
+                self.enter_display(display);
                 if self.reconcile_drag() {
                     self.relayout();
                 }
@@ -4177,6 +4278,85 @@ pub(crate) mod tests {
         m.backend.focused = Some(1);
         let _ = m.execute(&Command::Balance);
         assert_eq!(m.tree().windows(), vec![1]);
+    }
+
+    /// Windows 1 and 2 split the main display; window 3 fills the second.
+    fn two_and_one() -> Manager<MockBackend> {
+        let mut m = two_displays();
+        m.backend.open(1, "Terminal");
+        m.backend.open(2, "Safari");
+        open_on_second(&mut m, 3, "Mail");
+        m.refresh();
+        settle(&mut m);
+        assert_eq!(m.backend().frame(3), Rect::new(1000, 25, 800, 600));
+        m
+    }
+
+    /// Window 1 now sits on the second display, as the system says once the
+    /// user has dragged it there.
+    fn put_on_second(m: &mut Manager<MockBackend>, id: WinId) {
+        m.backend.display_of.insert(id, 1);
+        m.backend.space_of.insert(id, 7);
+    }
+
+    #[test]
+    fn dragging_a_window_onto_another_display_joins_its_layout() {
+        let mut m = two_and_one();
+        m.backend.cursor = m.backend.frame(1).center();
+        m.backend.mouse = true;
+        m.track_pointer();
+        // Moved, not resized: a size change would read as a resize.
+        let old = m.backend.frame(1);
+        m.backend.set_frame(1, Rect::new(1100, 100, old.w, old.h));
+        put_on_second(&mut m, 1);
+        m.backend.cursor = (1400.0, 300.0);
+        m.track_pointer();
+        assert_eq!(m.backend().overlay.map(|o| o.above), Some(3));
+        m.backend.mouse = false;
+        m.track_pointer();
+        settle(&mut m);
+        m.refresh();
+        settle(&mut m);
+
+        assert_eq!(m.backend().overlay, None);
+        assert_eq!(m.backend().frame(2), Rect::new(0, 25, 1000, 600));
+        let (a, b) = (m.backend().frame(1), m.backend().frame(3));
+        assert!(a.x >= 1000 && b.x >= 1000, "both on the second display");
+        assert!(a.w < 800 && b.w < 800, "and sharing it");
+    }
+
+    #[test]
+    fn a_modifier_drag_onto_another_display_joins_its_layout() {
+        let mut m = two_and_one();
+        m.track_pointer();
+        gesture(&mut m, MouseButton::Left, (100.0, 300.0), &[(1400.0, 300.0)]);
+        put_on_second(&mut m, 1);
+        settle(&mut m);
+        m.refresh();
+        settle(&mut m);
+
+        assert_eq!(m.backend().frame(2), Rect::new(0, 25, 1000, 600));
+        let (a, b) = (m.backend().frame(1), m.backend().frame(3));
+        assert!(a.x >= 1000 && b.x >= 1000, "both on the second display");
+        assert!(a.w < 800 && b.w < 800, "and sharing it");
+    }
+
+    #[test]
+    fn focus_follows_the_mouse_onto_another_display() {
+        let mut m = two_displays();
+        m.config.focus_follows_mouse = true;
+        m.backend.open(1, "Terminal");
+        open_on_second(&mut m, 2, "Safari");
+        m.refresh();
+        m.backend.focused = Some(1);
+        m.refresh();
+        assert_eq!(m.tree().windows(), vec![1]);
+        hover(&mut m, (100.0, 300.0), 0.2);
+        assert!(m.backend().focus_calls.is_empty(), "already focused");
+        hover(&mut m, (1300.0, 300.0), 0.05);
+        hover(&mut m, (1310.0, 300.0), 0.1);
+        assert_eq!(m.backend().focus_calls, vec![2]);
+        assert_eq!(m.tree().windows(), vec![2], "its display is the working one");
     }
 
     #[test]
