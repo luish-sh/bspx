@@ -107,14 +107,14 @@ If windows stop moving after an update, macOS has dropped the permission for the
 | `bspx float` | Float or tile the focused window |
 | `bspx raise-floating` | Bring floating windows to the front |
 | `bspx grid <rows:cols:x:y:w:h>` | Float the focused window and put it at a grid cell, e.g. `6:6:1:1:4:4` centres it at two thirds of the screen |
-| `bspx query` | List windows with their app names |
+| `bspx query` | List windows with their app names (and their display, when there is more than one) |
 | `bspx config <key> [value]` | Show or change a setting |
 | `bspx rule float\|tile "<app>"` | Never tile an app's windows, or tile them again; `"/regex/"` matches app names by pattern |
 | `bspx rule space <space> "<app>"` | Send an app's new windows to a Space |
 | `bspx rule grid <rows:cols:x:y:w:h> "<app>"` | Open an app's new windows floating at a grid cell, e.g. `4:4:3:0:1:1` is the top-right quarter of the top-right quarter |
 | `bspx label [<n> <name>]` | Name Space `n`; alone, list the Spaces |
 | `bspx bind ['<hotkey>']` | Add a keyboard shortcut; alone, list them |
-| `bspx space <space>` | Switch to a Space |
+| `bspx space <space>` | Switch to a Space of the working display (the one with the focused window, or under the pointer, see `commands_follow_cursor`) |
 | `bspx layout <space> bsp\|float` | Tile a Space, or leave its windows where you put them |
 | `bspx send <space>` | Move the focused window to a Space |
 | `bspx display <next\|prev\|n>` | Focus a window on another display (numbered from 1, left to right). `bspx focus` also crosses to the next display at the edge |

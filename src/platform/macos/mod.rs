@@ -1489,12 +1489,24 @@ impl Backend for MacBackend {
     }
 
     fn switch_display_to_space(&mut self, display: DisplayId, n: usize) -> Result<(), String> {
-        // `desktop::switch` drives the main display only.
-        if display == unsafe { CGMainDisplayID() } {
-            desktop::switch(n)
-        } else {
-            Err("switching Spaces on another display is not supported yet".into())
+        // The "switch to Desktop n" shortcut acts on the display under the
+        // pointer, so for another display the pointer goes there first.
+        if display != unsafe { CGMainDisplayID() } {
+            if self.screens.is_empty() {
+                self.screens = screens();
+            }
+            let screen = self
+                .screens
+                .iter()
+                .find(|s| s.display_id == display)
+                .ok_or_else(|| format!("display {display} is not connected"))?;
+            let (x, y) = (
+                screen.visible.x + screen.visible.w / 2,
+                screen.visible.y + screen.visible.h / 2,
+            );
+            self.warp_cursor(x as f32, y as f32);
         }
+        desktop::switch(n)
     }
 
     fn move_to_space(&mut self, id: WinId, space: u64) -> bool {

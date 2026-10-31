@@ -339,6 +339,10 @@ impl<B: Backend> Manager<B> {
             }
         }
         let current = self.display;
+        // The layouts of displays that were unplugged go now, so their
+        // windows are tiled where they ended up on this very poll.
+        self.others
+            .retain(|id, _| displays.iter().any(|d| d.id == *id));
 
         // Every display's area and Space first: a Space switch puts the old
         // layout away, and the focus lookup below goes through all layouts.
@@ -437,8 +441,6 @@ impl<B: Backend> Manager<B> {
             first.id
         };
         self.enter_display(back);
-        self.others
-            .retain(|id, _| displays.iter().any(|d| d.id == *id));
     }
 
     /// The part of `sync` that is about one display, which is the one
@@ -810,13 +812,21 @@ impl<B: Backend> Manager<B> {
         if self.config.float_spaces.is_empty() {
             return HashSet::new();
         }
-        let spaces = self.backend.spaces();
-        self.config
+        // Space n floats on every display that has one.
+        let mut displays: Vec<DisplayId> = self.others.keys().copied().collect();
+        displays.push(self.display);
+        let numbers: Vec<usize> = self
+            .config
             .float_spaces
             .iter()
             .filter_map(|s| self.config.space_number(s))
-            .filter_map(|n| spaces.get(n - 1).copied())
-            .collect()
+            .collect();
+        let mut out = HashSet::new();
+        for d in displays {
+            let spaces = self.backend.display_spaces(d);
+            out.extend(numbers.iter().filter_map(|n| spaces.get(n - 1).copied()));
+        }
+        out
     }
 
     /// The Space number and id `space` (a number or a label) stands for.
@@ -827,7 +837,7 @@ impl<B: Backend> Manager<B> {
             .ok_or_else(|| format!("no Space is labelled '{space}'"))?;
         let id = *self
             .backend
-            .spaces()
+            .display_spaces(self.display)
             .get(n - 1)
             .ok_or_else(|| format!("there is no Space {n}"))?;
         Ok((n, id))
@@ -2182,8 +2192,8 @@ impl<B: Backend> Manager<B> {
                 return Ok(String::new());
             }
             Command::Label(None) => {
-                let spaces = self.backend.spaces();
-                let current = self.backend.active_space();
+                let spaces = self.backend.display_spaces(self.display);
+                let current = self.backend.display_active_space(self.display);
                 let float_spaces = self.float_space_ids();
                 let mut out = String::new();
                 for (i, sid) in spaces.iter().enumerate() {
@@ -2248,8 +2258,8 @@ impl<B: Backend> Manager<B> {
             }
             Command::Space(ref space) => {
                 let (n, sid) = self.resolve_space(space)?;
-                if sid != self.backend.active_space() {
-                    self.backend.switch_to_space(n)?;
+                if sid != self.backend.display_active_space(self.display) {
+                    self.backend.switch_display_to_space(self.display, n)?;
                 }
                 return Ok(String::new());
             }
@@ -2263,15 +2273,25 @@ impl<B: Backend> Manager<B> {
     pub fn describe(&self) -> String {
         let mut ids: Vec<WinId> = self.frames.keys().copied().collect();
         ids.sort_unstable();
+        let order = self.display_order();
         let mut out = String::new();
         for id in ids {
             let f = self.anim.target(id).unwrap_or(self.frames[&id]);
             let state = if self.zoomed.is_some_and(|(w, _)| w == id) {
                 "zoomed"
-            } else if self.tree.contains(id) {
+            } else if self.display_with(id).is_some() {
                 "tiled"
             } else {
                 "floating"
+            };
+            // Which display holds the window, once there is a choice.
+            let on_display = match (order.len() > 1, self.display_with(id)) {
+                (true, Some(d)) => order
+                    .iter()
+                    .position(|o| *o == d)
+                    .map(|i| format!("\tdisplay {}", i + 1))
+                    .unwrap_or_default(),
+                _ => String::new(),
             };
             let focus = if self.focused == Some(id) {
                 " focused"
@@ -2292,7 +2312,7 @@ impl<B: Backend> Manager<B> {
                 String::new()
             };
             out.push_str(&format!(
-                "{id}\t{app}\t{},{} {}x{}\t{state}{focus}{rule}\n",
+                "{id}\t{app}\t{},{} {}x{}\t{state}{focus}{rule}{on_display}\n",
                 f.x, f.y, f.w, f.h
             ));
         }
@@ -4371,6 +4391,69 @@ pub(crate) mod tests {
         let (a, b) = (m.backend().frame(2), m.backend().frame(3));
         assert!(a.x >= 1000 && b.x >= 1000, "both stay on the second display");
         assert!(a.w < 800 && b.w < 800, "and share it");
+    }
+
+    #[test]
+    fn unplugging_a_display_retiles_its_windows_on_the_one_left() {
+        let mut m = two_displays();
+        m.backend.open(1, "Terminal");
+        open_on_second(&mut m, 2, "Safari");
+        m.refresh();
+        settle(&mut m);
+        assert_eq!(m.backend().frame(2), Rect::new(1000, 25, 800, 600));
+
+        // macOS moves the window to the display that is left.
+        m.backend.extra_displays.clear();
+        m.backend.display_of.remove(&2);
+        m.backend.space_of.insert(2, 0);
+        m.backend.windows.iter_mut().find(|w| w.id == 2).unwrap().frame =
+            Rect::new(100, 100, 300, 200);
+        m.refresh();
+        settle(&mut m);
+        assert_eq!(m.tree().windows().len(), 2);
+        let (a, b) = (m.backend().frame(1), m.backend().frame(2));
+        assert!(a.x + a.w <= 1000 && b.x + b.w <= 1000, "both on the main area");
+        assert!(a.w < 1000 && b.w < 1000, "and sharing it");
+    }
+
+    #[test]
+    fn plugging_a_display_in_starts_it_empty() {
+        let mut m = manager(0.0);
+        m.backend.open(1, "Terminal");
+        m.refresh();
+        settle(&mut m);
+        assert_eq!(m.backend().frame(1), Rect::new(0, 25, 1000, 600));
+
+        m.backend.extra_displays = vec![crate::platform::Display {
+            id: 1,
+            area: Rect::new(1000, 25, 800, 600),
+        }];
+        m.backend.display_space.insert(1, 7);
+        m.refresh();
+        open_on_second(&mut m, 2, "Safari");
+        m.refresh();
+        settle(&mut m);
+        assert_eq!(m.backend().frame(1), Rect::new(0, 25, 1000, 600));
+        assert_eq!(m.backend().frame(2), Rect::new(1000, 25, 800, 600));
+    }
+
+    #[test]
+    fn query_names_the_display_of_each_window() {
+        let mut m = two_displays();
+        m.backend.open(1, "Terminal");
+        open_on_second(&mut m, 2, "Safari");
+        m.refresh();
+        settle(&mut m);
+        let out = m.describe();
+        let line = |id: &str| out.lines().find(|l| l.starts_with(id)).unwrap().to_string();
+        assert!(line("1\t").contains("tiled") && line("1\t").ends_with("\tdisplay 1"));
+        assert!(line("2\t").contains("tiled") && line("2\t").ends_with("\tdisplay 2"));
+
+        // With one display there is nothing to choose, so no column.
+        let mut single = manager(0.0);
+        single.backend.open(1, "Terminal");
+        single.refresh();
+        assert!(!single.describe().contains("display"));
     }
 
     #[test]
